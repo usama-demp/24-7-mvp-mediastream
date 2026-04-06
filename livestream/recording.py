@@ -46,6 +46,9 @@ UPLOAD_SCAN_INTERVAL_SECONDS = int(os.getenv("UPLOAD_SCAN_INTERVAL_SECONDS", "30
 UPLOAD_MIN_FILE_AGE_SECONDS = int(os.getenv("UPLOAD_MIN_FILE_AGE_SECONDS", "90"))
 PROGRESS_BAR_WIDTH = int(os.getenv("PROGRESS_BAR_WIDTH", "28"))
 
+STALL_GRACE_SECONDS = int(os.getenv("STALL_GRACE_SECONDS", str(CHUNK_SECONDS + 240)))
+CHANNEL_REENABLE_SECONDS = int(os.getenv("CHANNEL_REENABLE_SECONDS", "1800"))
+
 OBS_ACCESS_KEY = os.getenv("OBS_ACCESS_KEY", "").strip()
 OBS_SECRET_KEY = os.getenv("OBS_SECRET_KEY", "").strip()
 OBS_BUCKET = os.getenv("OBS_BUCKET", "").strip()
@@ -84,7 +87,6 @@ CHANNELS = [
     {"name": "TRT World", "search_query": "TRT World live", "channel_live_url": None, "allowed_terms": ["trt world"], "blocked_terms": ["news18", "india"], "enabled": True},
     {"name": "DW English", "search_query": "DW News live", "channel_live_url": None, "allowed_terms": ["dw", "dw news", "deutsche welle"], "blocked_terms": ["news18", "india", "arabia"], "enabled": True},
     {"name": "Al Jazeera English", "search_query": "Al Jazeera English live", "channel_live_url": None, "allowed_terms": ["al jazeera english"], "blocked_terms": ["arabic", "mubasher", "news18", "india"], "enabled": True},
-    {"name": "Bloomberg", "search_query": "Bloomberg live", "channel_live_url": None, "allowed_terms": ["bloomberg"], "blocked_terms": ["bloomberg quint", "news18", "india"], "enabled": True},
     {"name": "Sky News", "search_query": "Sky News live", "channel_live_url": None, "allowed_terms": ["sky news", "skynews"], "blocked_terms": ["news18", "india", "pakistan", "cnn"], "enabled": True},
 ]
 
@@ -131,17 +133,20 @@ def run(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=check, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 def yt_dlp_base_args() -> List[str]:
-    args = [YTDLP_EXE]
+    args = [sys.executable, "-m", "yt_dlp"]
+    args += [
+        "--remote-components", "ejs:github",
+        "--extractor-args", "youtube:player_client=web",
+        "--add-headers", "User-Agent:Mozilla/5.0",
+        "--geo-bypass",
+        "--no-check-certificates",
+    ]
     if YTDLP_JS_RUNTIMES:
         args += ["--js-runtimes", YTDLP_JS_RUNTIMES]
     if YTDLP_COOKIES_FILE:
         args += ["--cookies", YTDLP_COOKIES_FILE]
     elif YTDLP_COOKIES_FROM_BROWSER:
         args += ["--cookies-from-browser", YTDLP_COOKIES_FROM_BROWSER]
-    args += [
-        "--add-headers", "User-Agent:Mozilla/5.0",
-        "--geo-bypass",
-    ]
     return args
 
 def ensure_tools():
@@ -371,6 +376,10 @@ class ChannelState:
     last_direct_url: Optional[str] = field(default=None, init=False)
     resolve_fail_count: int = field(default=0, init=False)
     disabled_due_to_error: bool = field(default=False, init=False)
+    disabled_at: float = field(default=0.0, init=False)
+    last_segment_time: float = field(default=0.0, init=False)
+    last_seen_segment_file: Optional[str] = field(default=None, init=False)
+    force_reacquire: bool = field(default=False, init=False)
 
     def __post_init__(self):
         self.folder_name = safe_name(self.name)
@@ -479,14 +488,31 @@ def resolve_live_watch_url(state: ChannelState) -> str:
     raise RuntimeError(" | ".join(errors))
 
 def get_direct_stream_urls(watch_url: str) -> List[str]:
-    cp = run(
-        yt_dlp_base_args() + ["-f", "best[protocol=m3u8]/best", "-g", watch_url],
-        check=False,
+    format_candidates = [
+        "b[protocol=m3u8]/b",
+        "best[protocol=m3u8]/best",
+        "best",
+    ]
+
+    errors = []
+
+    for fmt in format_candidates:
+        cmd = yt_dlp_base_args() + ["-f", fmt, "-g", watch_url]
+        cp = run(cmd, check=False)
+
+        lines = [line.strip() for line in cp.stdout.splitlines() if line.strip()]
+        if lines:
+            logging.info("Resolved direct stream URL for %s using format: %s", watch_url, fmt)
+            return lines
+
+        err = cp.stderr.strip() or f"No direct stream URL found using format {fmt}"
+        errors.append(f"{fmt}: {err}")
+        logging.warning("Direct stream resolution failed for %s using format %s", watch_url, fmt)
+
+    raise RuntimeError(
+        "Could not resolve direct stream from: "
+        f"{watch_url}\n" + "\n".join(errors)
     )
-    lines = [line.strip() for line in cp.stdout.splitlines() if line.strip()]
-    if not lines:
-        raise RuntimeError(cp.stderr.strip() or f"Could not resolve direct stream from: {watch_url}")
-    return lines
 
 def resolve_ingest_urls(state: ChannelState) -> Tuple[str, List[str]]:
     watch_url = resolve_live_watch_url(state)
@@ -495,12 +521,27 @@ def resolve_ingest_urls(state: ChannelState) -> Tuple[str, List[str]]:
     state.last_direct_url = " | ".join(direct_urls)
     return watch_url, direct_urls
 
+def newest_segment_file(state: ChannelState) -> Optional[Path]:
+    files = list(state.channel_dir.rglob(f"*{RECORD_EXT}"))
+    if not files:
+        return None
+    return max(files, key=lambda p: p.stat().st_mtime)
+
+def refresh_segment_heartbeat(state: ChannelState):
+    latest = newest_segment_file(state)
+    if not latest:
+        return
+    latest_path = str(latest)
+    latest_mtime = latest.stat().st_mtime
+    if state.last_seen_segment_file != latest_path or latest_mtime > state.last_segment_time:
+        state.last_seen_segment_file = latest_path
+        state.last_segment_time = latest_mtime
+
 def start_recording(state: ChannelState):
     state.last_start_attempt = time.time()
     logging.info("[%s] Searching current live stream...", state.name)
     watch_url, direct_urls = resolve_ingest_urls(state)
     out_pattern = build_output_pattern(state.channel_dir, state.folder_name)
-
     input_url = direct_urls[0]
 
     cmd = [
@@ -544,6 +585,9 @@ def start_recording(state: ChannelState):
     )
     state.resolve_fail_count = 0
     state.disabled_due_to_error = False
+    state.disabled_at = 0.0
+    state.force_reacquire = False
+    state.last_segment_time = time.time()
 
 def stop_recording(state: ChannelState):
     if state.process and state.process.poll() is None:
@@ -554,6 +598,12 @@ def stop_recording(state: ChannelState):
         except subprocess.TimeoutExpired:
             state.process.kill()
     state.process = None
+
+def force_restart_channel(state: ChannelState, reason: str):
+    logging.warning("[%s] Force restart triggered: %s", state.name, reason)
+    stop_recording(state)
+    state.force_reacquire = True
+    state.last_start_attempt = 0
 
 def process_is_running(state: ChannelState) -> bool:
     return state.process is not None and state.process.poll() is None
@@ -575,8 +625,30 @@ def check_process(state: ChannelState):
         msg += f"\n\nffmpeg error:\n{truncate(stderr_text)}"
     logging.error("[%s] %s", state.name, msg)
 
+def check_stream_stall(state: ChannelState):
+    if not process_is_running(state):
+        return
+    refresh_segment_heartbeat(state)
+    if state.last_segment_time <= 0:
+        return
+    idle_for = time.time() - state.last_segment_time
+    if idle_for >= STALL_GRACE_SECONDS:
+        force_restart_channel(state, f"no new segment for {int(idle_for)} seconds")
+
+def maybe_reenable_channel(state: ChannelState):
+    if not state.disabled_due_to_error:
+        return
+    if (time.time() - state.disabled_at) >= CHANNEL_REENABLE_SECONDS:
+        logging.info("[%s] Re-enabling channel after cooldown.", state.name)
+        state.disabled_due_to_error = False
+        state.resolve_fail_count = 0
+        state.last_start_attempt = 0
+
 def try_start_if_needed(state: ChannelState):
-    if not state.enabled or state.disabled_due_to_error:
+    if not state.enabled:
+        return
+    maybe_reenable_channel(state)
+    if state.disabled_due_to_error:
         return
     if process_is_running(state):
         return
@@ -589,81 +661,100 @@ def try_start_if_needed(state: ChannelState):
         state.process = None
         state.resolve_fail_count += 1
         state.last_error = truncate(str(e))
-        logging.error("[%s] Could not start recording. Attempt %s/%s\n%s", state.name, state.resolve_fail_count, MAX_RESOLVE_RETRIES, state.last_error)
+        logging.error(
+            "[%s] Could not start recording. Attempt %s/%s\n%s",
+            state.name,
+            state.resolve_fail_count,
+            MAX_RESOLVE_RETRIES,
+            state.last_error,
+        )
         if state.resolve_fail_count >= MAX_RESOLVE_RETRIES:
             state.disabled_due_to_error = True
-            logging.error("[%s] Skipping channel after %s failed attempts.", state.name, MAX_RESOLVE_RETRIES)
+            state.disabled_at = time.time()
+            logging.error(
+                "[%s] Temporarily disabling channel after %s failed attempts. Will retry after cooldown.",
+                state.name,
+                MAX_RESOLVE_RETRIES,
+            )
 
 def upload_completed_chunks(base_dir: Path):
-    files = sorted(base_dir.rglob(f"*{RECORD_EXT}"))
     uploaded_count = 0
     failed_count = 0
-    for rec_file in files:
-        if not rec_file.is_file():
+
+    for folder_name, state in STATE_BY_FOLDER_NAME.items():
+        if not state.channel_dir.exists():
             continue
-        uploaded_marker = sidecar_path_for(rec_file, UPLOADED_SUFFIX)
-        uploading_marker = sidecar_path_for(rec_file, UPLOADING_SUFFIX)
-        if uploaded_marker.exists():
-            continue
-        if uploading_marker.exists():
-            continue
-        if not is_file_ready(rec_file, min_age_seconds=UPLOAD_MIN_FILE_AGE_SECONDS):
-            continue
-        object_key = build_obs_key(rec_file)
-        if metadata_exists(object_key):
-            logging.info("Metadata already exists for object_key=%s, cleaning local file if present.", object_key)
-            uploaded_marker.touch(exist_ok=True)
+
+        for rec_file in sorted(state.channel_dir.rglob(f"*{RECORD_EXT}")):
+            if not rec_file.is_file():
+                continue
+
+            uploaded_marker = sidecar_path_for(rec_file, UPLOADED_SUFFIX)
+            uploading_marker = sidecar_path_for(rec_file, UPLOADING_SUFFIX)
+
+            if uploaded_marker.exists() or uploading_marker.exists():
+                continue
+
+            if not is_file_ready(rec_file, min_age_seconds=UPLOAD_MIN_FILE_AGE_SECONDS):
+                continue
+
+            object_key = build_obs_key(rec_file)
+
+            if metadata_exists(object_key):
+                logging.info("Metadata already exists for object_key=%s, cleaning local file if present.", object_key)
+                uploaded_marker.touch(exist_ok=True)
+                try:
+                    rec_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                continue
+
+            recorded_from, recorded_to = parse_recording_time_from_filename(rec_file)
+            file_size_bytes = rec_file.stat().st_size
+            s3_url = f"s3://{OBS_BUCKET}/{object_key}"
+            http_url = build_http_url(OBS_BUCKET, object_key)
+
             try:
+                uploading_marker.touch(exist_ok=False)
+                logging.info("Uploading to OBS: %s -> %s", rec_file, s3_url)
+                upload_file_to_obs(str(rec_file), object_key)
+
+                record = {
+                    "channel_name": state.name,
+                    "folder_name": folder_name,
+                    "recorded_from": recorded_from,
+                    "recorded_to": recorded_to,
+                    "local_file_name": rec_file.name,
+                    "bucket_name": OBS_BUCKET,
+                    "object_key": object_key,
+                    "s3_url": s3_url,
+                    "http_url": http_url,
+                    "watch_url": state.last_watch_url,
+                    "direct_url": state.last_direct_url,
+                    "file_size_bytes": file_size_bytes,
+                    "upload_time": datetime.now(),
+                }
+
+                insert_metadata(record)
+                uploaded_marker.touch(exist_ok=True)
                 rec_file.unlink(missing_ok=True)
-            except Exception:
-                pass
-            continue
-        channel_folder = rec_file.parent.parent.name
-        state = STATE_BY_FOLDER_NAME.get(channel_folder)
-        recorded_from, recorded_to = parse_recording_time_from_filename(rec_file)
-        file_size_bytes = rec_file.stat().st_size
-        s3_url = f"s3://{OBS_BUCKET}/{object_key}"
-        http_url = build_http_url(OBS_BUCKET, object_key)
-        watch_url = state.last_watch_url if state else None
-        direct_url = state.last_direct_url if state else None
-        channel_name = state.name if state else channel_folder.replace("_", " ").title()
-        try:
-            uploading_marker.touch(exist_ok=False)
-            logging.info("Uploading to OBS: %s -> %s", rec_file, s3_url)
-            upload_file_to_obs(str(rec_file), object_key)
-            record = {
-                "channel_name": channel_name,
-                "folder_name": channel_folder,
-                "recorded_from": recorded_from,
-                "recorded_to": recorded_to,
-                "local_file_name": rec_file.name,
-                "bucket_name": OBS_BUCKET,
-                "object_key": object_key,
-                "s3_url": s3_url,
-                "http_url": http_url,
-                "watch_url": watch_url,
-                "direct_url": direct_url,
-                "file_size_bytes": file_size_bytes,
-                "upload_time": datetime.now(),
-            }
-            insert_metadata(record)
-            uploaded_marker.touch(exist_ok=True)
-            rec_file.unlink(missing_ok=True)
-            uploading_marker.unlink(missing_ok=True)
-            logging.info("Uploaded successfully, metadata saved, local file removed: %s", rec_file)
-            uploaded_count += 1
-        except Exception as e:
-            logging.error("Upload/metadata failed for %s: %s", rec_file, truncate(str(e)))
-            uploading_marker.unlink(missing_ok=True)
-            failed_count += 1
+                uploading_marker.unlink(missing_ok=True)
+                logging.info("Uploaded successfully, metadata saved, local file removed: %s", rec_file)
+                uploaded_count += 1
+
+            except Exception as e:
+                logging.error("Upload/metadata failed for %s: %s", rec_file, truncate(str(e)))
+                uploading_marker.unlink(missing_ok=True)
+                failed_count += 1
+
     if uploaded_count or failed_count:
         logging.info("Upload scan complete | uploaded=%s | failed=%s", uploaded_count, failed_count)
 
 def cleanup_uploaded_markers(base_dir: Path):
     for marker in base_dir.rglob(f"*{UPLOADED_SUFFIX}"):
         try:
-            original_mp4 = Path(str(marker)[:-len(UPLOADED_SUFFIX)])
-            if not original_mp4.exists():
+            original_file = Path(str(marker)[:-len(UPLOADED_SUFFIX)])
+            if not original_file.exists():
                 marker.unlink(missing_ok=True)
         except Exception:
             pass
@@ -700,6 +791,8 @@ def main():
     logging.info("Host: %s", platform.node())
     logging.info("Channels: %d", len(states))
     logging.info("Chunk length: %s seconds", CHUNK_SECONDS)
+    logging.info("Stall grace: %s seconds", STALL_GRACE_SECONDS)
+    logging.info("Channel re-enable cooldown: %s seconds", CHANNEL_REENABLE_SECONDS)
     logging.info("Retention: last %d days", RETENTION_DAYS)
     logging.info("Base spool folder: %s", BASE_DIR)
     logging.info("OBS endpoint: %s", OBS_ENDPOINT)
@@ -711,9 +804,6 @@ def main():
     logging.info("yt-dlp js runtimes: %s", YTDLP_JS_RUNTIMES or "none")
     logging.info("yt-dlp cookies file: %s", YTDLP_COOKIES_FILE or "none")
     logging.info("Output format: %s", RECORD_EXT)
-    logging.info("Video preset: %s", VIDEO_PRESET)
-    logging.info("Video CRF: %s", VIDEO_CRF)
-    logging.info("Audio bitrate: %s", AUDIO_BITRATE)
     logging.info("====================================================")
 
     cycle_no = 0
@@ -730,6 +820,7 @@ def main():
                     break
                 render_progress(idx, total, cycle_no, state.name)
                 check_process(state)
+                check_stream_stall(state)
                 try_start_if_needed(state)
 
             now = time.time()
