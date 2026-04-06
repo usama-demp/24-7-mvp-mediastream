@@ -279,7 +279,7 @@ export default function Download() {
                       <span className="text-xs bg-blue-50 text-blue-700 px-2.5 py-1 rounded-full whitespace-nowrap">
                         {getChannelName(record.channel_id)}
                       </span>
-                    </div>
+                    </div> 
 
                     <div className="space-y-1 mb-4 text-sm text-gray-600">
                       <p>

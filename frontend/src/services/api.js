@@ -1,7 +1,7 @@
 // src/services/api.js
 
-const API_URL = "http://172.16.1.7:8000"; // your backend URL
-
+const API_URL = import.meta.env.VITE_API_URL || process.env.VITE_API_URL || "http://localhost:8000"; 
+console.log("API URL:", API_URL);
 // Generic request function
 async function request(endpoint, { method = "GET", body, headers = {} } = {}) {
   const token = localStorage.getItem("token");

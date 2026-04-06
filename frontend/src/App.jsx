@@ -11,6 +11,7 @@ import Channels from "./pages/Channels";
 import Download from "./pages/Download";
 import LiveStreams from "./pages/LiveStreams";
 import BackupDownload from "./pages/BackupDownload";
+import BackupStream from "./pages/BackupStream";
 
 function App() {
   const { user } = useAuthStore(); 
@@ -40,6 +41,7 @@ function App() {
           <Route path="download" element={<Download />} />
           <Route path="live-streams" element={<LiveStreams />} />
           <Route path="backup-download" element={<BackupDownload />} />
+          <Route path="backup-stream" element={<BackupStream />} />
         </Route>
 
         <Route path="*" element={<Navigate to="/login" replace />} />

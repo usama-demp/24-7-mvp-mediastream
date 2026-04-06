@@ -74,6 +74,7 @@ dmypy.json
 # Video cache
 .video_cache/
 video_cache/
+chunk_cache
 
 # HLS and streaming output
 live_output/hls/*
