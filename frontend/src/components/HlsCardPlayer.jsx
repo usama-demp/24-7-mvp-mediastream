@@ -1,30 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
 
-function buildPlaylist(tsUrl, durationSeconds = 600) {
-  return [
-    "#EXTM3U",
-    "#EXT-X-VERSION:3",
-    "#EXT-X-PLAYLIST-TYPE:VOD",
-    `#EXT-X-TARGETDURATION:${Math.max(1, Math.round(durationSeconds))}`,
-    "#EXT-X-MEDIA-SEQUENCE:0",
-    `#EXTINF:${Number(durationSeconds).toFixed(3)},`,
-    tsUrl,
-    "#EXT-X-ENDLIST",
-    "",
-  ].join("\n");
-}
-
 export default function HlsCardPlayer({
-  tsUrl,
-  durationSeconds = 600,
+  playlistUrl,
   autoLoad = false,
   isActive = false,
   onActivate,
 }) {
   const videoRef = useRef(null);
   const hlsRef = useRef(null);
-  const blobUrlRef = useRef(null);
   const [loaded, setLoaded] = useState(autoLoad);
   const [error, setError] = useState("");
 
@@ -33,28 +17,21 @@ export default function HlsCardPlayer({
   }, [autoLoad]);
 
   useEffect(() => {
-    if (!loaded || !isActive || !tsUrl || !videoRef.current) return;
+    if (!loaded || !isActive || !playlistUrl || !videoRef.current) return;
 
     const video = videoRef.current;
-    const playlistText = buildPlaylist(tsUrl, durationSeconds);
-    const blob = new Blob([playlistText], {
-      type: "application/vnd.apple.mpegurl",
-    });
-    const blobUrl = URL.createObjectURL(blob);
-    blobUrlRef.current = blobUrl;
-
-    let hls = null;
+    setError("");
 
     if (Hls.isSupported()) {
-      hls = new Hls({
+      const hls = new Hls({
         enableWorker: true,
         lowLatencyMode: false,
-        maxBufferLength: 30,
-        backBufferLength: 10,
+        backBufferLength: 30,
+        maxBufferLength: 60,
       });
 
       hlsRef.current = hls;
-      hls.loadSource(blobUrl);
+      hls.loadSource(playlistUrl);
       hls.attachMedia(video);
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -63,16 +40,41 @@ export default function HlsCardPlayer({
       });
 
       hls.on(Hls.Events.ERROR, (_, data) => {
-        if (data?.fatal) {
-          setError(data.details || "Playback failed");
+        console.error("HLS error:", data);
+
+        if (!data?.fatal) return;
+
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          setError(data.details || "Network error while loading video.");
+
+          try {
+            hls.startLoad();
+          } catch (err) {
+            console.error("Failed to restart HLS load:", err);
+          }
+          return;
         }
+
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          setError("Media error while decoding video.");
+
+          try {
+            hls.recoverMediaError();
+          } catch (err) {
+            console.error("Failed to recover media error:", err);
+          }
+          return;
+        }
+
+        setError(data.details || "Playback failed.");
+        hls.destroy();
+        hlsRef.current = null;
       });
     } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      video.src = blobUrl;
+      video.src = playlistUrl;
       video.play().catch(() => {});
-      setError("");
     } else {
-      setError("HLS not supported in this browser");
+      setError("HLS is not supported in this browser.");
     }
 
     return () => {
@@ -80,12 +82,14 @@ export default function HlsCardPlayer({
         hlsRef.current.destroy();
         hlsRef.current = null;
       }
-      if (blobUrlRef.current) {
-        URL.revokeObjectURL(blobUrlRef.current);
-        blobUrlRef.current = null;
+
+      if (video) {
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
       }
     };
-  }, [loaded, isActive, tsUrl, durationSeconds]);
+  }, [loaded, isActive, playlistUrl]);
 
   if (!loaded || !isActive) {
     return (
@@ -115,7 +119,7 @@ export default function HlsCardPlayer({
       <video
         ref={videoRef}
         controls
-        preload="none"
+        preload="metadata"
         playsInline
         className="w-full h-full"
       />

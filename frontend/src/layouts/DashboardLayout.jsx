@@ -15,14 +15,15 @@ export default function DashboardLayout() {
         { key: "users", label: "Users", path: "/dashboard/users" },
         { key: "channels", label: "Channels", path: "/dashboard/channels" },
         { key: "download", label: "Download", path: "/dashboard/download" },
-        { key: "live-streams", label: "Live Streams", path: "/dashboard/live-streams" },
-        { key: "backup-download", label: "Backup Download", path: "/dashboard/backup-download" },
-        { key: "backup-stream", label: "Backup Stream", path: "/dashboard/backup-stream" },
+        // { key: "live-streams", label: "Live Streams", path: "/dashboard/live-streams" },
+        // { key: "backup-download", label: "Backup Download", path: "/dashboard/backup-download" },
+        { key: "backup-stream", label: "Stream", path: "/dashboard/backup-stream" },
       ]
       : [
         { key: "dashboard", label: "Dashboard", path: "/dashboard" },
         { key: "download", label: "Download", path: "/dashboard/download" },
         { key: "live-streams", label: "Live Streams", path: "/dashboard/live-streams" },
+        { key: "backup-stream", label: "Stream", path: "/dashboard/backup-stream" },
       ];
 
   const handleLogout = () => {

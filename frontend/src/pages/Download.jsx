@@ -1,30 +1,26 @@
 import { useEffect, useMemo, useState } from "react";
 import toast, { Toaster } from "react-hot-toast";
 import HlsCardPlayer from "../components/HlsCardPlayer";
-import { fetchDownloadChannels, fetchRecordings } from "../services/api";
+import {
+  fetchDownloadChannels,
+  fetchRecordings,
+  getRecordingPlaylistUrl,
+  getRecordingDownloadUrl,
+} from "../services/api";
 
 function formatBytes(bytes) {
   if (!bytes || bytes <= 0) return "—";
+
   const units = ["B", "KB", "MB", "GB", "TB"];
   let value = bytes;
-  let i = 0;
+  let index = 0;
 
-  while (value >= 1024 && i < units.length - 1) {
+  while (value >= 1024 && index < units.length - 1) {
     value /= 1024;
-    i += 1;
+    index += 1;
   }
 
-  return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[i]}`;
-}
-
-function getDurationSeconds(record) {
-  if (record?.recorded_from && record?.recorded_to) {
-    const start = new Date(record.recorded_from).getTime();
-    const end = new Date(record.recorded_to).getTime();
-    const diff = Math.round((end - start) / 1000);
-    if (diff > 0) return diff;
-  }
-  return 600;
+  return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[index]}`;
 }
 
 export default function Download() {
@@ -54,7 +50,9 @@ export default function Download() {
     return map;
   }, [channels]);
 
-  const getChannelName = (id) => channelMap[String(id)] || `Channel ${id}`;
+  const getChannelName = (id) => {
+    return channelMap[String(id)] || `Channel ${id}`;
+  };
 
   const fetchAndSetRecords = async ({
     append = false,
@@ -64,7 +62,7 @@ export default function Download() {
     selectedEndDatetime = endDatetime,
   } = {}) => {
     try {
-      const res = await fetchRecordings({
+      const data = await fetchRecordings({
         channel_id: selectedChannelId || undefined,
         start_datetime: selectedStartDatetime || undefined,
         end_datetime: selectedEndDatetime || undefined,
@@ -72,28 +70,30 @@ export default function Download() {
         offset: nextOffset,
       });
 
-      const data = Array.isArray(res) ? res : [];
+      const safeData = Array.isArray(data) ? data : [];
 
       if (append) {
-        setRecords((prev) => [...prev, ...data]);
-        setOffset(nextOffset + data.length);
+        setRecords((prev) => [...prev, ...safeData]);
+        setOffset(nextOffset + safeData.length);
       } else {
-        setRecords(data);
-        setOffset(data.length);
+        setRecords(safeData);
+        setOffset(safeData.length);
       }
 
-      setHasMore(data.length === limit);
+      setHasMore(safeData.length === limit);
     } catch (err) {
-      toast.error(err.message || "Failed to fetch recordings");
+      console.error(err);
+      toast.error(err?.message || "Failed to fetch recordings");
     }
   };
 
   const loadChannels = async () => {
     try {
-      const res = await fetchDownloadChannels();
-      setChannels(Array.isArray(res) ? res : []);
+      const data = await fetchDownloadChannels();
+      setChannels(Array.isArray(data) ? data : []);
     } catch (err) {
-      toast.error(err.message || "Failed to load channels");
+      console.error(err);
+      toast.error(err?.message || "Failed to load channels");
     }
   };
 
@@ -112,7 +112,10 @@ export default function Download() {
   const applyFilters = async () => {
     setActiveRecordId(null);
     setLoading(true);
-    await fetchAndSetRecords({ append: false, nextOffset: 0 });
+    await fetchAndSetRecords({
+      append: false,
+      nextOffset: 0,
+    });
     setLoading(false);
   };
 
@@ -121,6 +124,7 @@ export default function Download() {
     setStartDatetime("");
     setEndDatetime("");
     setActiveRecordId(null);
+
     setLoading(true);
     await fetchAndSetRecords({
       append: false,
@@ -134,24 +138,21 @@ export default function Download() {
 
   const loadMore = async () => {
     setLoadingMore(true);
-    await fetchAndSetRecords({ append: true, nextOffset: offset });
+    await fetchAndSetRecords({
+      append: true,
+      nextOffset: offset,
+    });
     setLoadingMore(false);
   };
 
   const handleDownload = (record) => {
-    if (!record.download_url) {
-      toast.error("No download URL found");
-      return;
+    try {
+      const downloadUrl = getRecordingDownloadUrl(record.id);
+      window.open(downloadUrl, "_blank", "noopener,noreferrer");
+    } catch (err) {
+      console.error(err);
+      toast.error("Failed to start download");
     }
-
-    const a = document.createElement("a");
-    a.href = record.download_url;
-    a.target = "_blank";
-    a.rel = "noopener noreferrer";
-    a.download = record.local_file_name || `recording_${record.id}.ts`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
   };
 
   return (
@@ -214,6 +215,7 @@ export default function Download() {
 
             <div className="flex items-end">
               <button
+                type="button"
                 onClick={applyFilters}
                 className="w-full bg-blue-600 hover:bg-blue-700 text-white rounded-xl px-4 py-2.5 font-medium transition"
               >
@@ -223,6 +225,7 @@ export default function Download() {
 
             <div className="flex items-end">
               <button
+                type="button"
                 onClick={clearFilters}
                 className="w-full bg-gray-200 hover:bg-gray-300 text-gray-800 rounded-xl px-4 py-2.5 font-medium transition"
               >
@@ -249,20 +252,13 @@ export default function Download() {
                   className="bg-white rounded-2xl shadow-sm border overflow-hidden hover:shadow-md transition"
                 >
                   <div className="bg-black aspect-video">
-                    {record.video_url ? (
-                      <HlsCardPlayer
-                        key={`${record.id}-${activeRecordId === record.id ? "active" : "idle"}`}
-                        tsUrl={record.video_url}
-                        durationSeconds={getDurationSeconds(record)}
-                        autoLoad={activeRecordId === record.id}
-                        isActive={activeRecordId === record.id}
-                        onActivate={() => setActiveRecordId(record.id)}
-                      />
-                    ) : (
-                      <div className="w-full h-full flex items-center justify-center text-gray-400 text-sm">
-                        No playable URL available
-                      </div>
-                    )}
+                    <HlsCardPlayer
+                      key={`${record.id}-${activeRecordId === record.id ? "active" : "idle"}`}
+                      playlistUrl={getRecordingPlaylistUrl(record.id)}
+                      autoLoad={activeRecordId === record.id}
+                      isActive={activeRecordId === record.id}
+                      onActivate={() => setActiveRecordId(record.id)}
+                    />
                   </div>
 
                   <div className="p-4">
@@ -279,7 +275,7 @@ export default function Download() {
                       <span className="text-xs bg-blue-50 text-blue-700 px-2.5 py-1 rounded-full whitespace-nowrap">
                         {getChannelName(record.channel_id)}
                       </span>
-                    </div> 
+                    </div>
 
                     <div className="space-y-1 mb-4 text-sm text-gray-600">
                       <p>
@@ -294,12 +290,7 @@ export default function Download() {
                       <button
                         type="button"
                         onClick={() => handleDownload(record)}
-                        disabled={!record.download_url}
-                        className={`text-center rounded-xl px-4 py-2.5 font-medium transition ${
-                          record.download_url
-                            ? "bg-green-600 hover:bg-green-700 text-white"
-                            : "bg-gray-200 text-gray-500 cursor-not-allowed"
-                        }`}
+                        className="text-center rounded-xl px-4 py-2.5 font-medium transition bg-green-600 hover:bg-green-700 text-white"
                       >
                         Download
                       </button>
@@ -312,6 +303,7 @@ export default function Download() {
             {hasMore && (
               <div className="mt-8 flex justify-center">
                 <button
+                  type="button"
                   onClick={loadMore}
                   disabled={loadingMore}
                   className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white px-6 py-3 rounded-xl font-medium transition"
